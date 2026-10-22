@@ -28,6 +28,13 @@ jobs:
         with:
           node-version: "20"
 
+      # 計算機の上のコード（PY）の前半は numpy で試験する
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install numpy
+        run: python -m pip install --disable-pip-version-check numpy
+
       # ui.js はビルドなしの 1 ファイル。純関数と、計算機の上のコード（PY）の検査をテストで通す
       - name: Test
         run: npm run verify
