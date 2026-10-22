@@ -24,6 +24,18 @@ test("targetProblem: 通る画像と止める画像", () => {
   assert.match(targetProblem({ ...ok, sliceCount: 3 }), /3 枚/);
 });
 
+test("targetProblem: CR/DX 以外のモダリティはすべて理由つきで止める（CT・MR・PT・US ほか）", () => {
+  for (const m of ["CT", "MR", "PT", "US", "XA", "NM", "MG", "RF", "SC", "OT", ""]) {
+    assert.match(targetProblem({ kind: "image", modality: m, sliceCount: 1 }) ?? "", /CR\/DX/, m);
+  }
+  for (const m of ["CR", "DX", "dx"]) assert.equal(targetProblem({ kind: "image", modality: m, sliceCount: 1 }), null, m);
+});
+
+test("免責と説明文に『胸部の正面像』の限定が書かれている", () => {
+  assert.match(DISCLAIMER, /胸部の正面像（PA\/AP）の 1 枚だけ/);
+  assert.match(DISCLAIMER, /部位と撮影方向を判定しません/);
+});
+
 test("buildScript: 固定の 3 値だけが入り、本体の上限と埋め込み検査の目安に収まる", () => {
   const s = buildScript();
   assert.ok(s.startsWith("GRAPHY = __import__('json').loads("));
@@ -101,7 +113,7 @@ test("load_image: MONOCHROME1 は反転する（負例との対）", () => {
 
 test("load_image: 使えない画像は not-applicable で止まる（CT・複数枚・一定値）", () => {
   const cases = [
-    [{ modality: "CT" }, ramp, /not-applicable: .*CT/],
+    ...["CT", "MR", "PT", "US", "XA", "NM"].map((m) => [{ modality: m }, ramp, new RegExp(`not-applicable: .*${m}`)]),
     [{ modality: "MG" }, ramp, /not-applicable: .*MG/],
     [{ modality: "DX" }, { shape: [2, 1, 2], v: [0, 1, 2, 3] }, /not-applicable: .*2 枚/],
     [{ modality: "DX" }, { shape: [1, 1, 2], v: [5, 5] }, /not-applicable: .*一定/],
