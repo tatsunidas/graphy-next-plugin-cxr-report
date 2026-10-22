@@ -60,6 +60,34 @@ def env_problem(installed, need):
     return None
 
 
+def crop_box(rows, cols, side):
+    """Resize(side)（短辺を side に）→ CenterCrop(side) が元画像で見ている範囲 {x0, y0, w, h}（元画像の画素座標）"""
+    short = min(rows, cols)
+    scale = side / short
+    new_h, new_w = (side, int(side * cols / rows)) if rows <= cols else (int(side * rows / cols), side)
+    top, left = int(round((new_h - side) / 2.0)), int(round((new_w - side) / 2.0))
+    return {'x0': left / scale, 'y0': top / scale, 'w': side / scale, 'h': side / scale}
+
+
+def sentence_spans(ids, dot, specials, n):
+    """生成列 ids[0:n] を文に分ける。返す (a, b) は対数確率 lp[a:b]（= 予測する ids[a+1 .. b]）。
+    '.' で閉じ、直後の sep / eos は同じ文に含める（単独の文にしない）"""
+    last = n - 1
+    spans, a, t = [], 0, 0
+    while t < last:
+        end = t + 1
+        if ids[end] == dot:
+            while end < last and ids[end + 1] in specials:
+                end += 1
+            spans.append((a, end))
+            a = t = end
+        else:
+            t += 1
+    if a < last:
+        spans.append((a, last))
+    return spans
+
+
 def load_image(path):
     """npz の volume[1, y, x] を窓で 8bit にする。使えない画像は not-applicable: で止める"""
     import numpy as np
@@ -119,14 +147,53 @@ with torch.no_grad():
     out = model.generate(
         pixel_values=px, special_token_ids=[tok.sep_token_id], bos_token_id=tok.bos_token_id,
         eos_token_id=tok.eos_token_id, pad_token_id=tok.pad_token_id, return_dict_in_generate=True,
-        use_cache=True, max_length=256, num_beams=4)
+        use_cache=True, max_length=256, num_beams=4, output_scores=True)
 findings, impression = model.split_and_decode_sections(out.sequences, [tok.sep_token_id, tok.eos_token_id], tok)
-stage('generated', 0.95)
+stage('generated', 0.85)
+
+# --- Grad-CAM（文ごと）。対象は CvT の最終段の特徴マップ（射影の手前）。生成済みの系列で teacher forcing をやり直し、
+# 文の対数確率の和を特徴マップで微分する。やり直した確率が generate の sequences_scores と合わなければ、別の確率を
+# 微分していることになるので cam は出さない（理由を返す）
+cam_info = {'cam': None, 'camError': None}
+try:
+    seq = out.sequences
+    ids = seq[0].tolist()
+    n = sum(1 for i in ids if i != tok.pad_token_id)
+    fm = model.encoder.cvt(px).last_hidden_state
+    tokens = model.encoder.projection_head(torch.permute(torch.flatten(fm, 2), [0, 2, 1]))
+    din = seq[:, :n - 1]
+    tt = model.token_ids_to_token_type_ids(din, [tok.sep_token_id])
+    o = model(encoder_outputs=(tokens,), decoder_input_ids=din, decoder_token_type_ids=tt, return_dict=True)
+    lp = torch.log_softmax(o.logits, -1).gather(-1, seq[:, 1:n].unsqueeze(-1)).squeeze(-1)[0]
+    gap = abs(lp.sum().item() / (n - 1) - out.sequences_scores[0].item())
+    if gap > 0.01:
+        raise RuntimeError('gradcam-mismatch: 再計算した確率が生成時と合いません（差 %.4f）' % gap)
+    spans = sentence_spans(ids, tok.convert_tokens_to_ids('.'), (tok.sep_token_id, tok.eos_token_id), n)
+    sep_at = ids.index(tok.sep_token_id) if tok.sep_token_id in ids else None
+    cams, sentences = [], []
+    for a, b in spans:
+        g, = torch.autograd.grad(lp[a:b].sum(), fm, retain_graph=True)
+        cams.append(torch.relu((g.mean(dim=(2, 3), keepdim=True) * fm).sum(1))[0].detach())
+        sentences.append({
+            'section': 'findings' if (sep_at is None or a + 1 <= sep_at) else 'impression',
+            'text': tok.decode(ids[a + 1:b + 1], skip_special_tokens=True).strip(),
+            'logprob': round(lp[a:b].sum().item(), 3), 'tokens': b - a,
+        })
+    peak = max(c.max().item() for c in cams)
+    for c, sent in zip(cams, sentences):
+        m = c.max().item()
+        sent['strength'] = round(m / peak, 3) if peak > 0 else 0.0
+    np.save('outputs/cam.npy', np.stack([(c / c.max()).numpy() if c.max() > 0 else c.numpy() for c in cams]).astype(np.float32))
+    cam_info = {'cam': {'shape': list(cams[0].shape), 'crop': crop_box(info['rows'], info['cols'], side), 'sentences': sentences,
+                        'gap': round(gap, 5)}, 'camError': None}
+except Exception as e:
+    cam_info = {'cam': None, 'camError': type(e).__name__ + ': ' + str(e)}
+stage('gradcam', 0.95)
 json.dump({
     'findings': findings[0], 'impression': impression[0],
     'model': name, 'revision': rev, 'device': device,
     'torch': torch.__version__, 'transformers': transformers.__version__,
-    'seconds': round(time.time() - T0, 1), **info,
+    'seconds': round(time.time() - T0, 1), **info, **cam_info,
 }, open('outputs/report.json', 'w', encoding='utf-8'), ensure_ascii=False)
 stage('done', 1.0)
 `;
@@ -137,6 +204,45 @@ export const PY = PY_PREP + PY_MODEL;
 export function buildScript() {
   const cfg = { model: MODEL, revision: REVISION, transformers: TRANSFORMERS };
   return `GRAPHY = __import__('json').loads(${JSON.stringify(JSON.stringify(cfg))})\n` + PY;
+}
+
+/** float32・C 順・little-endian の .npy を読む（cam.npy 用）。 */
+export function parseNpyF32(/** @type {Uint8Array} */ bytes) {
+  if (bytes[0] !== 0x93 || String.fromCharCode(...bytes.subarray(1, 6)) !== "NUMPY") throw new Error("npy ではありません");
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const hlen = bytes[6] === 1 ? dv.getUint16(8, true) : dv.getUint32(8, true);
+  const off = (bytes[6] === 1 ? 10 : 12) + hlen;
+  const header = new TextDecoder().decode(bytes.subarray(off - hlen, off));
+  if (!/'descr': *'<f4'/.test(header) || /'fortran_order': *True/.test(header)) throw new Error("float32・C 順の npy だけ読めます: " + header);
+  const shape = [.../\(([^)]*)\)/.exec(header)?.[1].matchAll(/\d+/g) ?? []].map((m) => Number(m[0]));
+  const n = shape.reduce((a, b) => a * b, 1);
+  if (bytes.byteLength - off !== n * 4) throw new Error("npy の大きさが合いません");
+  const data = new Float32Array(n);
+  for (let i = 0; i < n; i++) data[i] = dv.getFloat32(off + i * 4, true);
+  return { shape, data };
+}
+
+/**
+ * 特徴マップ 1 枚（h×w・0〜1）を、モデルが見た範囲 crop（元画像の画素座標）に双線形で伸ばし、元画像の rows×cols に置く。
+ * 範囲の外（中央切り出しで落ちた端）は NaN（オーバーレイで透明）。
+ */
+export function upsampleCam(/** @type {Float32Array} */ cam, /** @type {[number, number]} */ [h, w], /** @type {{x0:number,y0:number,w:number,h:number}} */ crop, rows, cols) {
+  const out = new Float32Array(rows * cols).fill(NaN);
+  const x1 = crop.x0 + crop.w, y1 = crop.y0 + crop.h;
+  for (let y = Math.max(0, Math.floor(crop.y0)); y < Math.min(rows, Math.ceil(y1)); y++) {
+    const v = Math.min(h - 1, Math.max(0, ((y + 0.5 - crop.y0) / crop.h) * h - 0.5));
+    if (y + 0.5 < crop.y0 || y + 0.5 > y1) continue;
+    const v0 = Math.floor(v), v1 = Math.min(h - 1, v0 + 1), fv = v - v0;
+    for (let x = Math.max(0, Math.floor(crop.x0)); x < Math.min(cols, Math.ceil(x1)); x++) {
+      if (x + 0.5 < crop.x0 || x + 0.5 > x1) continue;
+      const u = Math.min(w - 1, Math.max(0, ((x + 0.5 - crop.x0) / crop.w) * w - 0.5));
+      const u0 = Math.floor(u), u1 = Math.min(w - 1, u0 + 1), fu = u - u0;
+      out[y * cols + x] =
+        cam[v0 * w + u0] * (1 - fu) * (1 - fv) + cam[v0 * w + u1] * fu * (1 - fv) +
+        cam[v1 * w + u0] * (1 - fu) * fv + cam[v1 * w + u1] * fu * fv;
+    }
+  }
+  return out;
 }
 
 /** 本体がデータを作らなかった・送らなかった理由（よく出るものだけ）。 */
@@ -228,11 +334,64 @@ export async function activate(host) {
     return el("div", {}, el("div", { style: "display: flex; gap: 8px; align-items: center; font-weight: 600" }, label, copy), area);
   };
 
+  /** Grad-CAM の節: 文を押すと、その文の生成に効いた領域を画像に重ねる。 */
+  async function camSection(/** @type {any} */ r, /** @type {any} */ rep) {
+    const box = el("div", { testid: "cxr-cam", style: "display: flex; flex-direction: column; gap: 6px" });
+    box.append(el("div", { style: "font-weight: 600" }, "Grad-CAM（文を押すと画像に重ねます）"));
+    if (!rep.cam) {
+      box.append(el("div", { testid: "cxr-cam-error", style: "opacity: 0.85" }, `Grad-CAM は作れませんでした: ${rep.camError ?? "不明"}`));
+      state.cam = { error: rep.camError ?? null };
+      return box;
+    }
+    const raw = await r.readFile("cam.npy");
+    if (!raw) {
+      box.append(el("div", { testid: "cxr-cam-error" }, "Grad-CAM は作れませんでした: cam.npy が返りませんでした"));
+      return box;
+    }
+    const npy = parseNpyF32(raw);
+    const [h, w] = rep.cam.shape;
+    const sentences = rep.cam.sentences;
+    box.append(el("div", { style: "font-size: 12px; opacity: 0.8; line-height: 1.5" },
+      "その文の生成に効いた領域です。所見が正しいことの根拠ではありません。" +
+      `解像度は粗く（${h}×${w}）、画像にない内容（年齢・撮影方向など）には意味のある領域が出ません。` +
+      "「強さ」は全文の最大に対する比で、小さい文は画像にほとんど依存していません。"));
+    // 本体の LUT「Hot_Iron」の見た目（低=青 → 赤 → 黄 → 高=白）。LUT が変わったらここも合わせる
+    box.append(el("div", { testid: "cxr-cam-legend", style: "display: flex; gap: 6px; align-items: center; font-size: 11px; opacity: 0.9" },
+      "効いていない",
+      el("div", { style: "width: 160px; height: 10px; border-radius: 2px; background: linear-gradient(to right, #0101fe, #fa0104 50%, #fefa01 75%, #fefef5)" }),
+      "強く効いた"));
+    const opacity = el("input", { type: "range", min: "0.2", max: "0.8", step: "0.05", value: "0.5", testid: "cxr-cam-opacity" });
+    const clear = el("button", { textContent: "消す", testid: "cxr-cam-clear", style: "font-size: 11px" });
+    box.append(el("div", { style: "display: flex; gap: 8px; align-items: center; font-size: 12px" }, "不透明度", opacity, clear));
+    const rowsEl = [];
+    const show = (/** @type {number} */ k) => {
+      const data = upsampleCam(npy.data.subarray(k * h * w, (k + 1) * h * w), [h, w], rep.cam.crop, rep.rows, rep.cols);
+      const ok = host.showOverlay(target.tileId, { data, rows: rep.rows, cols: rep.cols, colormap: "Hot_Iron", opacity: Number(opacity.value), window: { center: 0.5, width: 1 } });
+      state.cam = { shown: ok ? k : null, error: ok ? null : "overlay-refused" };
+      if (!ok) setStatus("重ねられませんでした（画像の大きさが表示中のものと合いません）");
+      rowsEl.forEach((e, i) => { e.style.outline = ok && i === k ? "2px solid #f0b36b" : "none"; });
+    };
+    sentences.forEach((/** @type {any} */ sent, /** @type {number} */ k) => {
+      const row = el("div", {
+        testid: `cxr-cam-sentence-${k}`, textContent: `${sent.section === "findings" ? "所見" : "印象"}｜${sent.text}（強さ ${sent.strength.toFixed(2)}）`,
+        style: "cursor: pointer; padding: 4px 6px; border: 1px solid #8884; border-radius: 4px; font-size: 12px",
+      });
+      row.addEventListener("click", () => show(k));
+      rowsEl.push(row);
+      box.append(row);
+    });
+    opacity.addEventListener("change", () => { if (Number.isInteger(state.cam?.shown)) show(state.cam.shown); });
+    clear.addEventListener("click", () => { host.clearOverlay(target.tileId); state.cam = { shown: null, error: null }; rowsEl.forEach((e) => { e.style.outline = "none"; }); });
+    state.cam = { shown: null, error: null, sentences: sentences.length };
+    return box;
+  }
+
   runBtn.addEventListener("click", async () => {
     runBtn.disabled = true;
     result.style.display = "none";
     result.replaceChildren();
-    state.phase = "running"; state.error = undefined; state.report = undefined;
+    host.clearOverlay?.(target.tileId);
+    state.phase = "running"; state.error = undefined; state.report = undefined; state.cam = undefined;
     setStatus("送っています…");
     const r = await host.compute.runJob({
       endpointId: "local",
@@ -267,6 +426,7 @@ export async function activate(host) {
       section("印象（impression）", rep.impression, "cxr-impression"),
       el("div", { testid: "cxr-meta", style: "font-size: 11px; opacity: 0.75" },
         `${rep.model} @ ${String(rep.revision).slice(0, 8)}・${rep.device}・${rep.seconds} 秒・窓: ${rep.window === "dicom" ? "DICOM の窓" : "最小〜最大"}`),
+      await camSection(r, rep),
     );
     result.style.display = "flex";
     setStatus("できました");

@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { DISCLAIMER, PY, PY_PREP, REVISION, TRANSFORMERS, activate, buildScript, explain, failureText, targetProblem } from "./ui.js";
+import { DISCLAIMER, PY, PY_PREP, REVISION, TRANSFORMERS, activate, buildScript, explain, failureText, parseNpyF32, targetProblem, upsampleCam } from "./ui.js";
 
 const PYTHON = process.env.GRAPHY_TEST_PYTHON || "python3";
 const py = (code, cwd) => spawnSync(PYTHON, ["-I", "-c", code], { cwd, encoding: "utf8" });
@@ -212,4 +212,132 @@ test("画面: CT のタイルでは窓を開かず、理由を通知する", asy
   await activate(host);
   assert.equal(container.kids.length, 0);
   assert.match(notes[0], /CR\/DX/);
+});
+
+
+// --- Grad-CAM ---
+test("crop_box: 正方形はそのまま、横長・縦長は中央の正方形（切り落とした端が出る）", () => {
+  const run = (rows, cols) => JSON.parse(py(`
+${PY_PREP}
+print(json.dumps(crop_box(${rows}, ${cols}, 384)))
+`).stdout);
+  assert.deepEqual(run(1024, 1024), { x0: 0, y0: 0, w: 1024, h: 1024 });
+  assert.deepEqual(run(2000, 1000), { x0: 0, y0: 500, w: 1000, h: 1000 });
+  assert.deepEqual(run(1000, 2000), { x0: 500, y0: 0, w: 1000, h: 1000 });
+});
+
+test("sentence_spans: '.' で閉じ、続く sep / eos は同じ文に含める。全トークンを 1 度ずつ覆う", () => {
+  // ids: bos a b . c . SEP d . EOS（dot=9 sep=3 eos=2）
+  const ids = [101, 5, 6, 9, 7, 9, 3, 8, 9, 2];
+  const r = JSON.parse(py(`
+${PY_PREP}
+print(json.dumps(sentence_spans(${JSON.stringify(ids)}, 9, (3, 2), ${ids.length})))
+`).stdout);
+  assert.deepEqual(r, [[0, 3], [3, 6], [6, 9]]);
+  assert.equal(r[0][0], 0);
+  for (let i = 1; i < r.length; i++) assert.equal(r[i][0], r[i - 1][1], "隙間も重なりも無い");
+  assert.equal(r.at(-1)[1], ids.length - 1);
+  // '.' で終わらない末尾も 1 文になる
+  const tail = JSON.parse(py(`
+${PY_PREP}
+print(json.dumps(sentence_spans([101, 5, 9, 7, 8], 9, (3, 2), 5)))
+`).stdout);
+  assert.deepEqual(tail, [[0, 2], [2, 4]]);
+});
+
+test("parseNpyF32: numpy が書いた float32 を読む。別の型は拒否（負例）", () => {
+  const dump = (dtype) => spawnSync(PYTHON, ["-I", "-c", `import numpy as np,sys,io;b=io.BytesIO();np.save(b,np.arange(24,dtype=np.${dtype}).reshape(2,3,4));sys.stdout.buffer.write(b.getvalue())`]).stdout;
+  const r = parseNpyF32(new Uint8Array(dump("float32")));
+  assert.deepEqual(r.shape, [2, 3, 4]);
+  assert.deepEqual([r.data[0], r.data[5], r.data[23]], [0, 5, 23]);
+  assert.throws(() => parseNpyF32(new Uint8Array(dump("float64"))), /float32/);
+});
+
+test("upsampleCam: 正方形は全面・横長の画像は切り落とした端が NaN・角と中央の値が合う", () => {
+  const cam = Float32Array.from([0, 1, 2, 3]); // 2×2: 左上 0・右上 1・左下 2・右下 3
+  const sq = upsampleCam(cam, [2, 2], { x0: 0, y0: 0, w: 8, h: 8 }, 8, 8);
+  assert.ok(!sq.some(Number.isNaN));
+  assert.equal(sq[0], 0);
+  assert.equal(sq[7], 1);
+  assert.equal(sq[7 * 8], 2);
+  assert.equal(sq[63], 3);
+  // 縦 4・横 8 の画像で、中央の 4×4（x0=2）だけを見た場合: 左右の端 2 列ずつが NaN
+  const wide = upsampleCam(cam, [2, 2], { x0: 2, y0: 0, w: 4, h: 4 }, 4, 8);
+  for (let y = 0; y < 4; y++) {
+    assert.ok(Number.isNaN(wide[y * 8]) && Number.isNaN(wide[y * 8 + 1]) && Number.isNaN(wide[y * 8 + 6]) && Number.isNaN(wide[y * 8 + 7]));
+    assert.ok(!Number.isNaN(wide[y * 8 + 2]) && !Number.isNaN(wide[y * 8 + 5]));
+  }
+  assert.equal(wide[2], 0);
+  assert.equal(wide[5], 1);
+  assert.equal(wide[3 * 8 + 2], 2);
+  assert.equal(wide[3 * 8 + 5], 3);
+  // 定数のマップは定数のまま
+  const flat = upsampleCam(new Float32Array(9).fill(0.5), [3, 3], { x0: 0, y0: 0, w: 10, h: 10 }, 10, 10);
+  assert.ok(flat.every((v) => v === 0.5));
+});
+
+function npyOf(shape, values) {
+  const header0 = `{'descr': '<f4', 'fortran_order': False, 'shape': (${shape.join(", ")}), }`;
+  const pad = (64 - ((10 + header0.length + 1) % 64)) % 64;
+  const header = header0 + " ".repeat(pad) + "\n";
+  const out = new Uint8Array(10 + header.length + values.length * 4);
+  out.set([0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59, 1, 0]);
+  new DataView(out.buffer).setUint16(8, header.length, true);
+  out.set(new TextEncoder().encode(header), 10);
+  const dv = new DataView(out.buffer);
+  values.forEach((v, i) => dv.setFloat32(10 + header.length + i * 4, v, true));
+  return out;
+}
+
+function camEnv(rep, camBytes) {
+  const e = fakeEnv({ ok: true, status: "ok", readFile: async (n) => (n === "report.json" ? new TextEncoder().encode(JSON.stringify(rep)) : n === "cam.npy" ? camBytes : null) });
+  const overlays = [], cleared = [];
+  e.host.showOverlay = (tile, o) => { overlays.push({ tile, ...o }); return true; };
+  e.host.clearOverlay = (tile) => cleared.push(tile);
+  e.host.getTargets = () => [{ kind: "image", modality: "DX", sliceCount: 1, studyUid: "S", seriesUid: "R", seriesLabel: "CXR", tileId: "T1" }];
+  return { ...e, overlays, cleared };
+}
+const baseRep = { findings: "F.", impression: "I.", model: "m", revision: "84dfcba8aaaa", device: "cpu", seconds: 1, window: "dicom", rows: 8, cols: 8 };
+
+test("画面: 文を押すと、その文の cam が元画像の大きさで重なり、消すと外れる", async () => {
+  const rep = { ...baseRep, camError: null, cam: { shape: [2, 2], crop: { x0: 0, y0: 0, w: 8, h: 8 }, gap: 0.0001,
+    sentences: [{ section: "findings", text: "Clear lungs.", strength: 1 }, { section: "impression", text: "Normal.", strength: 0.2 }] } };
+  const { host, container, overlays, cleared } = camEnv(rep, npyOf([2, 2, 2], [0, 1, 2, 3, 3, 2, 1, 0]));
+  await activate(host);
+  await container.find("cxr-run").handlers.click();
+  assert.match(container.find("cxr-cam-sentence-1").textContent, /印象｜Normal\.（強さ 0\.20）/);
+  assert.match(container.find("cxr-cam-legend").text(), /効いていない.*強く効いた/, "色の凡例が出る");
+  container.find("cxr-cam-sentence-1").handlers.click();
+  assert.equal(overlays.length, 1);
+  assert.equal(overlays[0].tile, "T1");
+  assert.equal(overlays[0].rows, 8);
+  assert.equal(overlays[0].cols, 8);
+  assert.equal(overlays[0].data.length, 64);
+  assert.equal(overlays[0].data[0], 3, "2 文目のマップの左上は 3（1 文目の 0 ではない）");
+  assert.equal(globalThis.window.__cxrReportState.cam.shown, 1);
+  container.find("cxr-cam-clear").handlers.click();
+  assert.deepEqual(cleared.slice(-1), ["T1"]);
+  assert.equal(globalThis.window.__cxrReportState.cam.shown, null);
+});
+
+test("画面: Grad-CAM が作れなかったときは理由を出し、レポートは出す（負例）", async () => {
+  const rep = { ...baseRep, cam: null, camError: "RuntimeError: gradcam-mismatch: 再計算した確率が生成時と合いません（差 0.3000）" };
+  const { host, container, overlays } = camEnv(rep, null);
+  await activate(host);
+  await container.find("cxr-run").handlers.click();
+  assert.match(container.find("cxr-cam-error").text(), /作れませんでした: .*gradcam-mismatch/);
+  assert.equal(container.find("cxr-findings").value, "F.", "レポートは出る");
+  assert.equal(container.find("cxr-cam-sentence-0"), null);
+  assert.equal(overlays.length, 0);
+});
+
+test("画面: 本体が重ねを断ったら（大きさ不一致）理由を出す", async () => {
+  const rep = { ...baseRep, camError: null, cam: { shape: [2, 2], crop: { x0: 0, y0: 0, w: 8, h: 8 }, sentences: [{ section: "findings", text: "A.", strength: 1 }] } };
+  const { host, container } = camEnv(rep, npyOf([1, 2, 2], [0, 1, 2, 3]));
+  host.showOverlay = () => false;
+  await activate(host);
+  await container.find("cxr-run").handlers.click();
+  container.find("cxr-cam-sentence-0").handlers.click();
+  assert.match(container.find("cxr-status").textContent, /重ねられませんでした/);
+  assert.equal(globalThis.window.__cxrReportState.cam.error, "overlay-refused");
 });
