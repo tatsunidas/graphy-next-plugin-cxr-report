@@ -1,0 +1,86 @@
+# GRAPHY-Next プラグインのリリース。タグ v<version> を push すると、
+# <id>-<version>.zip と .sha256 を作って GitHub Release に添付する。
+# GRAPHY-Next のプラグインマネージャはこの zip 資産（直下に plugin.json）を取得・検証・展開する。
+name: Release plugin
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    # ステップ内 env は同じステップの if から参照できないため、ジョブレベルで公開する。
+    env:
+      MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+      MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 任意: バックエンド面（Java）を持つプラグインはここでビルドし、jar をルートへ置く。
+      # UI のみのプラグインはこのブロックを削除してよい。
+      - name: Build backend jar (optional)
+        if: hashFiles('backend-optional/pom.xml') != ''
+        run: |
+          echo "backend-optional/ を使う場合は README の手順で API jar を入れてから有効化してください。"
+          echo "デフォルトの雛形では UI のみのため、このステップはスキップされます。"
+
+      - name: Resolve id / version
+        id: meta
+        run: |
+          id=$(jq -r .id plugin.json)
+          pjver=$(jq -r .version plugin.json)
+          ver="${GITHUB_REF_NAME#v}"
+          if [ "$pjver" != "$ver" ]; then
+            echo "::error::plugin.json version ($pjver) != tag ($ver). 版とタグを一致させてください。"
+            exit 1
+          fi
+          echo "id=$id"   >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Package zip (+ sha256)
+        run: |
+          name="${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}"
+          mkdir -p pkg dist
+          cp plugin.json ui.js pkg/
+          # バックエンド面をビルドした場合は *.jar もルートに置かれる → 同梱。
+          for j in *.jar; do [ -e "$j" ] && cp "$j" pkg/; done
+          (cd pkg && zip -r "../dist/$name.zip" .)     # 直下に plugin.json を置く（マネージャの前提）
+          (cd dist && sha256sum "$name.zip" > "$name.zip.sha256")
+          ls -la dist
+
+      # 署名（任意だが強く推奨）。secrets に MINISIGN_SECRET_KEY / MINISIGN_PASSWORD を入れると、
+      # <zip>.minisig と minisign.pub を添付する。GRAPHY-Next 側は初回導入でこの鍵を記録し、
+      # 次回以降の更新が同じ鍵で署名されていることを自動で確認する（違えば拒否）。
+      # 署名があるとユーザー側の導入は確認画面なしの「押すだけ」になる。
+      - name: Sign package (optional)
+        if: ${{ env.MINISIGN_SECRET_KEY != '' }}
+        run: |
+          # 公開鍵はリポジトリ直下に minisign.pub として置いておく（秘密ではない）。
+          # 秘密鍵の中身は secrets.MINISIGN_SECRET_KEY、パスワードは secrets.MINISIGN_PASSWORD。
+          if [ ! -f minisign.pub ]; then
+            echo "::error::minisign.pub がリポジトリにありません（minisign -G で作り、公開鍵だけコミットしてください）"
+            exit 1
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          name="${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}"
+          printf '%s' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s /tmp/minisign.key \
+            -m "dist/$name.zip" -t "$name" -x "dist/$name.zip.minisig"
+          rm -f /tmp/minisign.key
+          cp minisign.pub dist/
+          # 自分の公開鍵で検証できることを確認してから公開する。
+          minisign -V -p minisign.pub -m "dist/$name.zip" -x "dist/$name.zip.minisig"
+          ls -la dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}.zip
+            dist/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}.zip.sha256
+            dist/${{ steps.meta.outputs.id }}-${{ steps.meta.outputs.ver }}.zip.minisig
+            dist/minisign.pub
