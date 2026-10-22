@@ -341,3 +341,9 @@ test("画面: 本体が重ねを断ったら（大きさ不一致）理由を出
   assert.match(container.find("cxr-status").textContent, /重ねられませんでした/);
   assert.equal(globalThis.window.__cxrReportState.cam.error, "overlay-refused");
 });
+
+test("計算機の上のコード: .numpy() は必ず .cpu() の後（GPU のテンソルは直接 numpy にできない）", () => {
+  const bad = PY.split("\n").filter((l) => /\.numpy\(\)/.test(l) && /[^u]\.numpy\(\)/.test(l.replace(/\.cpu\(\)\.numpy\(\)/g, "")));
+  assert.deepEqual(bad, []);
+  assert.ok(/\.cpu\(\)\.numpy\(\)/.test(PY));
+});

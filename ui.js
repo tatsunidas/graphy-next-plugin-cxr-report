@@ -183,7 +183,7 @@ try:
     for c, sent in zip(cams, sentences):
         m = c.max().item()
         sent['strength'] = round(m / peak, 3) if peak > 0 else 0.0
-    np.save('outputs/cam.npy', np.stack([(c / c.max()).numpy() if c.max() > 0 else c.numpy() for c in cams]).astype(np.float32))
+    np.save('outputs/cam.npy', np.stack([(c / c.max()).cpu().numpy() if c.max() > 0 else c.cpu().numpy() for c in cams]).astype(np.float32))
     cam_info = {'cam': {'shape': list(cams[0].shape), 'crop': crop_box(info['rows'], info['cols'], side), 'sentences': sentences,
                         'gap': round(gap, 5)}, 'camError': None}
 except Exception as e:
