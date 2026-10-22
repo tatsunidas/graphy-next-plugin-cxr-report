@@ -1013,62 +1013,6 @@ export interface PluginMeshMeasurement {
   boundsMax: [number, number, number];
 }
 
-/** 測るラベルの volume（H66）。`loadVolume` と同じ z-major の並び。0=背景。 */
-export interface PluginLabelInput {
-  data: Uint8Array | Uint16Array;
-  dims: [number, number, number];
-  indexToWorld: number[];
-}
-
-export interface PluginLabelStatsOptions {
-  /** 測るラベル。省略時は出てくる全部。 */
-  labels?: number[];
-  /** 1 にすると、境界の 1 ボクセル（6 近傍）を除いた統計（`eroded`）も返す。 */
-  erodeVoxels?: 0 | 1;
-  /** 面積を出すスライス（格子の k）。 */
-  slices?: number[];
-  /** スライス内で、値がこの範囲（両端を含む）に入る画素の面積も出す。 */
-  valueRanges?: Array<{ name: string; min: number; max: number }>;
-}
-
-/** 値の統計（ROI 統計と同じ実装。母標準偏差・非有限値は除く）。 */
-export interface PluginValueStats {
-  n: number;
-  mean: number;
-  sd: number;
-  min: number;
-  max: number;
-  median: number;
-  sum: number;
-  p5: number;
-  p95: number;
-  unit: string;
-}
-
-export interface PluginLabelSliceMeasurement {
-  k: number;
-  pixelCount: number;
-  /** 画素の数え上げ × 画素面積（ROI 統計のメッシュの面積とは別の量）。 */
-  areaCm2: number;
-  /** 前景が無ければ NaN。 */
-  mean: number;
-  rangeAreasCm2: Record<string, number>;
-}
-
-export interface PluginLabelMeasurement {
-  label: number;
-  voxelCount: number;
-  volumeMm3: number;
-  volumeMl: number;
-  unit: string;
-  stats: PluginValueStats | null;
-  eroded?: PluginValueStats | null;
-  kRange: [number, number];
-  /** ボクセル中心の重心（患者 LPS mm）。 */
-  centroidLps: [number, number, number];
-  slices: PluginLabelSliceMeasurement[];
-}
-
 /** 中心線グラフの節点（H41・**0.2.9 以降**）。端点 degree=1 / 分岐点 degree>=3。 */
 export interface PluginCenterlineNode {
   id: number;
@@ -1224,40 +1168,6 @@ interface PluginHostBase {
      * 確保していなければ `{ok:true, released:false}`。次の `runJob` が自動で確保し直す。
      */
     releaseRuntime: (endpointId: string, opts?: { ask?: boolean }) => Promise<ComputeReleaseOutcome>;
-  };
-  /**
-   * **保管庫の画像を手元に確保する**（H67・**0.5.0 以降**）。Drive が正本のモード（手元は上限つきのキャッシュ）で、
-   * 手元に無い画像を Drive から取り寄せる。**パスは返さない**（検査・シリーズの UID を渡すだけ）。
-   * 新しい権限・同意は要らない（利用者自身の Drive のデータを手元へ戻すだけで、外へは出ない）。
-   * モード A でなければ何もしない（`cacheMode: false`）。
-   */
-  storage: {
-    /**
-     * 検査（`seriesUids` を渡せばそのシリーズだけ）の画像のうち、手元に無いものを取り寄せる。進み具合・取り消しは
-     * `runBackendJob` と同じ。結果は例外でなく値で返る（`error` は理由コード）。取り寄せた直後の画像は、しばらく手元から消されない。
-     */
-    ensureLocal: (req: StorageEnsureRequest, opts?: PluginJobOptions) => Promise<StorageEnsureOutcome>;
-    /** モード・手元の使用量と上限・Drive にだけある画像の数（読み取りのみ）。 */
-    status: () => Promise<StorageStatus>;
-  };
-  /**
-   * **消えてもよい派生データの置き場**（H69）。再構成結果・特徴量・長い計算の途中経過など、作り直せるが高いものを
-   * 再起動をまたいで置く。🔴 **いつでも消える**（上限・再起動・アプリの更新・利用者の操作）ので、唯一のコピーを
-   * 置かないこと。永続させたいものは `saveStore`（H8）へ。新しい権限・同意は要らない（ローカルだけで外へは出ない）。
-   * 呼び出しはプラグインの id に固定され、他のプラグインの項目は見えない（誤接触の防止で、信頼境界ではない）。
-   * 例外は投げず値で返す。鍵は 1〜256 文字（制御文字なし）。1 件の大きさに上限がある（既定 16 MiB。大きなデータは checkpoint の添字で分割する）。
-   * 全プラグインが 1 つの上限を共有するので、大量に置くと他のプラグインの項目を追い出しうる。デスクトップ専用。
-   */
-  cache: PluginCache;
-  /**
-   * **顕微鏡の取り込み**（H68・**0.5.0 より後の版**）。プラグインが自分のジョブ（`runBackendJob`）で一時フォルダ
-   * `<java.io.tmpdir>/graphy-plugin-microscopy/<プラグイン ID>/` に書いた画素（Raw）を、チャネルごとに
-   * Confocal Microscopy Image（**32 ビット・DICOM 規格外**）として取り込む。**毎回、本体が確認画面を出す**（消せない）。
-   * 1 チャネル＝1 シリーズ。同じ検査・Frame of Reference にまとまる。取り込んだ画素ファイルは本体が消す。
-   * デスクトップ専用（web では `error: "desktop-only"`）。途中で失敗しても、取り込めた分は `imported` に入る。
-   */
-  microscopy: {
-    importVolume: (req: PluginMicroscopyImportRequest, opts?: PluginJobOptions) => Promise<PluginMicroscopyImportOutcome>;
   };
   /** 本体の DB（H44・H46・H51・**0.3.0 以降**）。 */
   db: {
@@ -1442,54 +1352,6 @@ export type PickFilesResult =
   | { ok: true; paths: string[] }
   | { ok: false; canceled?: boolean; error?: string };
 
-/** `host.cache.put()` などの結果（H69）。`error` は `invalid-key`・`invalid-index`・`too-large`・`write-failed`・`desktop-only`・`network`。 */
-export type CachePutOutcome = { ok: true } | { ok: false; error: string };
-
-/** `host.cache.checkpoint(jobKey)`（H69）。同じ `jobKey` で再実行したとき、済んだ部分を読んで続きから計算する。 */
-export interface PluginCacheCheckpoint {
-  /** `index`（0〜999999）番目の部分を保存する（上書き）。 */
-  save: (index: number, data: Uint8Array | ArrayBuffer) => Promise<CachePutOutcome>;
-  /** `index` 番目の部分。無い・消えた・壊れているときは null。 */
-  load: (index: number) => Promise<Uint8Array | null>;
-  /** この `jobKey` の途中結果をすべて消す（完了したときに呼ぶ）。 */
-  clear: () => Promise<void>;
-}
-
-/** `host.cache`（H69）。 */
-export interface PluginCache {
-  /** 保存した値。無い・消えたときは null。 */
-  get: (key: string) => Promise<Uint8Array | null>;
-  put: (key: string, data: Uint8Array | ArrayBuffer) => Promise<CachePutOutcome>;
-  has: (key: string) => Promise<boolean>;
-  remove: (key: string) => Promise<void>;
-  checkpoint: (jobKey: string) => PluginCacheCheckpoint;
-}
-
-/** `host.storage.ensureLocal()` の要求（H67）。 */
-export interface StorageEnsureRequest {
-  studyUid: string;
-  /** 省略すると検査全体。 */
-  seriesUids?: string[];
-}
-
-/**
- * `host.storage.ensureLocal()` の結果（H67）。例外は投げない。`cancelled: true` は利用者の取り消し。
- * `error` は理由コード: `offline`・`needs-login`・`drive-disabled`・`md5-mismatch`・`no-checksum`・`not-on-drive`・
- * `drive-error`（取り寄せ）、`not-found`（検査・シリーズが無い）、`invalid-*`（要求の形）。
- */
-export type StorageEnsureOutcome =
-  | { ok: true; total: number; fetched: number; alreadyLocal: number; cacheMode: boolean }
-  | { ok: false; cancelled?: boolean; error?: string; fetched?: number };
-
-/** `host.storage.status()` の結果（H67）。 */
-export interface StorageStatus {
-  cacheMode: boolean;
-  usedBytes: number;
-  limitBytes: number;
-  /** Drive にだけある（手元に無い）画像の数。 */
-  remoteOnlyCount: number;
-}
-
 /** `host.runBackendJob()` の引数（H45）。 */
 export interface PluginJobOptions {
   /** 進み具合（0〜1）と短い説明。ポーリングのたびに呼ばれる。 */
@@ -1522,16 +1384,7 @@ export interface ComputeRunJobOptions {
   script: string;
   /** 0〜8 件。0 件なら画像を送らずコードだけを実行する（同意画面と監査は同じ）。 */
   inputs: ComputeJobInput[];
-  /**
-   * 環境設定 ＞ 計算機 の ID。**省略すると利用者の既定の計算機**——利用者が「既定にする」で選んだもの。選んでいなければ、
-   * この PC に CUDA の使える GPU があればこの PC、無ければ Colab の GPU T4、それも無ければトークンの入った最初の計算機。
-   * どこで走るかはプラグインからは決められない（毎回の同意画面に実際の送り先が出る）。GPU が小さい PC でメモリ不足になりうる重いモデルは、
-   * 失敗の理由（`stderr`）をそのまま利用者に見せ、「既定の計算機を変えてください」と案内すること。
-   * `"local"` を指すと、この PC の Python（環境設定 ＞ 計算機 ＞ この PC で見つかったもの）で実行する。
-   * データは PC の外へ出ないが、コードはこの PC 上で利用者の権限で動く（同意画面にその旨が出る）。
-   * 使えないときは `error: "local-unavailable"`（Python・jupyter_server・ipykernel が揃っていない）。
-   * 既定を「この PC」に選んでいて使えないときも、省略時に同じ `local-unavailable` を返す（黙って Colab へ落とさない）。
-   */
+  /** 環境設定 ＞ 外部の計算機 の ID。省略するとトークンの入った最初の計算機。 */
   endpointId?: string;
   /** 秒。既定 3600・上限 6 時間。 */
   timeoutSec?: number;
@@ -2013,11 +1866,6 @@ export interface Viewer2DPluginHost extends PluginHostBase {
    */
   measureMask: (mask: PluginMaskInput, opts?: PluginMeshOptions) => PluginMeshMeasurement[];
   /**
-   * **ラベルの volume を測る**（H66・**0.4.0 の次の版から**）。体積（数え上げ）・値の統計・重心・
-   * 指定スライスの面積。`values` は H10 で読んだボリュームそのもの（格子が合わなければ例外）。
-   */
-  measureLabels: (labels: PluginLabelInput, values: PluginVolume, opts?: PluginLabelStatsOptions) => PluginLabelMeasurement[];
-  /**
    * **マスクを 3D 細線化して中心線グラフにする**（H41・**0.2.9 以降**）。0=背景 / >0=前景。
    *
    * <p>本体の Lee-Kashyap-Chu 1994 細線化（Fiji Skeletonize3D と数値一致）＋ 26 近傍歩行を
@@ -2223,11 +2071,7 @@ export interface SrMeasurementGroup {
       | "timeIntegratedActivity"
       | "effectiveHalfLife"
       | "bed"
-      | "eqd2"
-      // H66 の定量（fw/ct-quant-design.md §6）。meanValue・stdDev は unit 必須（HU / SUV を取り違えない）。meanValue は負も可
-      | "area"
-      | "meanValue"
-      | "stdDev";
+      | "eqd2";
     value: number;
     unit?: string;
   }[];
@@ -2383,45 +2227,3 @@ export interface LabelVolumeRequest {
 }
 
 export type LabelVolumeResult = { ok: true; segmentationId: string; segmentCount: number } | { ok: false; error: string };
-
-/** H68 の 1 チャネル。`spec` は本体の Raw の読み方と同じ。画素間隔は mm。 */
-export interface PluginMicroscopyChannel {
-  /** そのプラグインの一時フォルダの下の画素ファイル。取り込んだら本体が消す。 */
-  path: string;
-  spec: {
-    width: number;
-    height: number;
-    slices: number;
-    phases: number;
-    type: "uint8" | "int8" | "uint16" | "int16" | "uint32" | "int32" | "float32" | "float64";
-    byteOrder: "little" | "big";
-    offset: number;
-    /** [x, y, z] mm */
-    spacing: [number, number, number];
-    orientation?: "axial";
-  };
-  channelName?: string;
-  /** 照明の波長 nm。分からなければ省く（入れずに「不明」と記録される）。 */
-  wavelengthNm?: number | null;
-}
-
-export interface PluginMicroscopyImportRequest {
-  sourceName: string;
-  sourceFormat: string;
-  patient: { patientId: string; patientName?: string; birthDate?: string; sex?: string };
-  studyDescription?: string;
-  /** 省略で SCT 91723000 "Anatomical Structure"。 */
-  anatomy?: { value: string; scheme: string; meaning: string } | null;
-  confocalMode?: "FLUORESCENCE" | "REFLECTANCE";
-  channels: PluginMicroscopyChannel[];
-}
-
-export interface PluginMicroscopyImported {
-  seriesInstanceUid: string;
-  channelName: string;
-  frames: number;
-}
-
-export type PluginMicroscopyImportOutcome =
-  | { ok: true; studyInstanceUid?: string; imported: PluginMicroscopyImported[] }
-  | { ok: false; error?: string; cancelled?: boolean; studyInstanceUid?: string; imported: PluginMicroscopyImported[] };
