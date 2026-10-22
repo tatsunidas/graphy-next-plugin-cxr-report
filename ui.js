@@ -20,7 +20,9 @@ export const TRANSFORMERS = "4.46.3";
 
 export const DISCLAIMER =
   "研究用の下書きです。診断・治療の判断に使わないでください。生成された文は誤りを含み、画像にない内容" +
-  "（撮影方向・年齢・性別・過去画像との比較など）が入ることがあります。";
+  "（撮影方向・年齢・性別・過去画像との比較など）が入ることがあります。" +
+  "対象は胸部の正面像（PA/AP）の 1 枚だけです。側面像や胸部以外の部位の画像でも実行はできますが、結果は無意味です" +
+  "（このプラグインは部位と撮影方向を判定しません）。";
 
 // ---------------------------------------------------------------------------
 // 計算機の上で走る Python。先頭に GRAPHY（model・revision・transformers）が足される。
@@ -206,6 +208,7 @@ export async function activate(host) {
     testid: "cxr-about",
     style: "font-size: 12px; opacity: 0.8; line-height: 1.5",
     textContent:
+      `胸部の正面像（PA/AP）の 1 枚だけを入れてください。部位と撮影方向は判定しません。` +
       `モデル: ${MODEL}（Apache-2.0。MIMIC-CXR で学習）。画像はこの PC の計算機だけに渡り、外へは出ません。` +
       "初回は重み（約 430 MB）を Hugging Face から取得します。CPU では 1 枚に 10 秒〜1 分ほどかかります。" +
       "計算機の Python に torch・torchvision・transformers==" + TRANSFORMERS + " が必要です（環境は書き換えません）。",
