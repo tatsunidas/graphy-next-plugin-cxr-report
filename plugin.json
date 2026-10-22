@@ -1,7 +1,7 @@
 {
   "id": "vis-cxr-report",
   "name": "Chest X-ray Report Draft (CXRMate)",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "engines": { "graphy": ">=0.5.1", "os": ["win32", "darwin", "linux"] },
   "description": "Draft a findings / impression text for one chest radiograph (CR/DX) with CXRMate (aehrc, Apache-2.0), run on this PC only. Research use only - not a diagnostic device; generated text can be wrong.",
   "author": "Visionary Imaging Services, Inc.",
