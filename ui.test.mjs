@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { DISCLAIMER, PY, PY_PREP, REVISION, TRANSFORMERS, activate, buildScript, explain, failureText, parseNpyF32, targetProblem, upsampleCam } from "./ui.js";
+import { DISCLAIMER, PY, PY_PREP, PY_PROBE, buildProbeScript, installCommand, REVISION, TRANSFORMERS, activate, buildScript, explain, failureText, parseNpyF32, targetProblem, upsampleCam } from "./ui.js";
 
 const PYTHON = process.env.GRAPHY_TEST_PYTHON || "python3";
 const py = (code, cwd) => spawnSync(PYTHON, ["-I", "-c", code], { cwd, encoding: "utf8" });
@@ -158,7 +158,14 @@ class El {
   text() { return this.textContent + this.kids.map((k) => (k instanceof El ? k.text() : String(k))).join(""); }
   find(id) { if (this.dataset.testid === id) return this; for (const k of this.kids) { const f = k instanceof El ? k.find(id) : null; if (f) return f; } return null; }
 }
-function fakeEnv(outcome, target = { kind: "image", modality: "DX", sliceCount: 1, studyUid: "S", seriesUid: "R", seriesLabel: "CXR PA" }) {
+const NEED = { torch: null, torchvision: null, transformers: TRANSFORMERS, pillow: null, numpy: null };
+const envJson = (installed, extra = {}) => ({
+  python: "/usr/bin/python3", pyVersion: "3.11.9", need: NEED, cuda: false, weightsCached: true, torchError: null, ...extra,
+  installed: { torch: "2.4.0", torchvision: "0.19.0", transformers: TRANSFORMERS, pillow: "10.0.0", numpy: "1.26.0", ...installed },
+  problem: null,
+});
+const probeOutcome = (env) => ({ ok: true, status: "ok", readFile: async (n) => (n === "env.json" ? new TextEncoder().encode(JSON.stringify(env)) : null) });
+function fakeEnv(outcome, target = { kind: "image", modality: "DX", sliceCount: 1, studyUid: "S", seriesUid: "R", seriesLabel: "CXR PA" }, probes = [probeOutcome(envJson({}))]) {
   globalThis.window = {};
   globalThis.document = { createElement: (t) => new El(t) };
   const calls = [], notes = [];
@@ -167,7 +174,8 @@ function fakeEnv(outcome, target = { kind: "image", modality: "DX", sliceCount: 
     getTargets: () => [target],
     notify: (m) => notes.push(m),
     openWindow: () => ({ container }),
-    compute: { runJob: async (opts) => { calls.push(opts); return outcome; } },
+    // 事前チェック（inputs が空）は probes を順に返す。最後の 1 件は繰り返す。本処理は outcome
+    compute: { runJob: async (opts) => { calls.push(opts); return opts.inputs.length === 0 ? (probes.length > 1 ? probes.shift() : probes[0]) : outcome; } },
   };
   return { host, calls, notes, container };
 }
@@ -179,10 +187,11 @@ test("画面: 免責は常に出ており、実行は local へ npz 1 件で渡�
   await activate(host);
   assert.equal(container.find("cxr-disclaimer").textContent.includes(DISCLAIMER), true);
   await container.find("cxr-run").handlers.click();
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].endpointId, "local");
-  assert.deepEqual(calls[0].inputs, [{ studyUid: "S", seriesUid: "R", format: "npz" }]);
-  assert.equal(calls[0].script, buildScript());
+  assert.equal(calls.length, 2, "事前チェック 1 回＋本処理 1 回");
+  assert.deepEqual(calls[0].inputs, [], "事前チェックは画像を送らない");
+  assert.equal(calls[1].endpointId, "local");
+  assert.deepEqual(calls[1].inputs, [{ studyUid: "S", seriesUid: "R", format: "npz" }]);
+  assert.equal(calls[1].script, buildScript());
   assert.equal(container.find("cxr-findings").value, "No pneumothorax.");
   assert.equal(container.find("cxr-impression").value, "Normal.");
   assert.equal(container.find("cxr-status").textContent, "できました");
@@ -346,4 +355,108 @@ test("計算機の上のコード: .numpy() は必ず .cpu() の後（GPU のテ
   const bad = PY.split("\n").filter((l) => /\.numpy\(\)/.test(l) && /[^u]\.numpy\(\)/.test(l.replace(/\.cpu\(\)\.numpy\(\)/g, "")));
   assert.deepEqual(bad, []);
   assert.ok(/\.cpu\(\)\.numpy\(\)/.test(PY));
+});
+
+// --- 事前チェック（依存パッケージの案内） ---
+test("installCommand: 不足・版違いだけを、計算機が使う Python を名指しして入れる", () => {
+  const need = { torch: null, transformers: TRANSFORMERS, pillow: null };
+  assert.equal(installCommand("/usr/bin/python3", { torch: null, transformers: TRANSFORMERS, pillow: "10" }, need), "/usr/bin/python3 -m pip install torch");
+  assert.equal(installCommand("/usr/bin/python3", { torch: "2", transformers: "4.57.6", pillow: null }, need),
+    `/usr/bin/python3 -m pip install transformers==${TRANSFORMERS} pillow`);
+  assert.equal(installCommand("C:\\Python311\\python.exe", { torch: null, transformers: TRANSFORMERS, pillow: "1" }, need), "C:\\Python311\\python.exe -m pip install torch");
+  assert.equal(installCommand("C:\\Users\\A B\\py\\python.exe", { torch: null, transformers: TRANSFORMERS, pillow: "1" }, need), '"C:\\Users\\A B\\py\\python.exe" -m pip install torch', "空白を含むパスは引用符");
+  assert.equal(installCommand("/usr/bin/python3", { torch: "2.4.0+cpu", transformers: `${TRANSFORMERS}+x`, pillow: "1" }, need), null, "ローカル版の接尾辞（+cpu）は版違いに数えない・揃っていれば null");
+});
+
+const probe = (versions, { fakeTorch = false } = {}) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cxr-probe-"));
+  try {
+    // 版の表だけを偽装する（試験機に torch があるかどうかに左右されない）。判定・書き出しは本物の PY_PROBE
+    const script = buildProbeScript().replace("\nstage('probe', 0.3)", `
+_VER = json.loads(${JSON.stringify(JSON.stringify(versions))})
+version_of = lambda d: _VER.get(d)
+${fakeTorch ? "import types; _t = types.ModuleType('torch'); _t.cuda = types.SimpleNamespace(is_available=lambda: False); sys.modules['torch'] = _t" : ""}
+stage('probe', 0.3)`);
+    const r = py(script, dir);
+    assert.equal(r.status, 0, r.stderr);
+    return JSON.parse(fs.readFileSync(path.join(dir, "outputs", "env.json"), "utf-8"));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+};
+const ALL = { torch: "2.4.0", torchvision: "0.19.0", transformers: TRANSFORMERS, pillow: "10", numpy: "1.26" };
+
+test("プローブ: 揃っていれば problem は null、Python の場所と版を返す", () => {
+  const e = probe(ALL, { fakeTorch: true });
+  assert.equal(e.problem, null);
+  assert.equal(e.cuda, false);
+  assert.ok(e.python && e.pyVersion);
+  assert.deepEqual(e.need, NEED);
+});
+
+test("プローブ: 無い・版違い・読み込めない torch は problem にする（負例）", () => {
+  assert.match(probe({ ...ALL, torch: null }).problem, /^missing-packages: .*torch/);
+  assert.match(probe({ ...ALL, transformers: "4.57.6" }, { fakeTorch: true }).problem, /^unsupported-version: transformers 4\.57\.6/);
+  // 入っているが読み込めない（Windows の DLL 不足など）。この試験機には torch が無いので、本物の import が失敗する
+  const probeNoFake = probe(ALL);
+  if (probeNoFake.torchError) assert.match(probeNoFake.problem, /^broken-package: torch を読み込めません/);
+});
+
+test("画面: 不足なら本処理を出さず、環境の枠にコマンドを出す。入れて［再確認］で通り、実行できる", async () => {
+  const missing = { ...probeOutcome({ ...envJson({ torch: null }), problem: "missing-packages: x" }) };
+  const fixed = probeOutcome(envJson({}));
+  const rep = { findings: "f", impression: "i", model: "m", revision: "84dfcba8aaaa", device: "cpu", seconds: 1, window: "minmax" };
+  const { host, calls, container } = fakeEnv(okOutcome(rep), undefined, [missing, fixed]);
+  await activate(host);
+  await container.find("cxr-run").handlers.click();
+  assert.equal(calls.length, 1, "本処理は出さない（事前チェックだけ）");
+  assert.deepEqual(calls[0].inputs, []);
+  assert.equal(calls[0].script, buildProbeScript());
+  assert.equal(container.find("cxr-env").style.display, "flex");
+  assert.equal(container.find("cxr-env-command").value, "/usr/bin/python3 -m pip install torch");
+  assert.match(container.find("cxr-env-python").text(), /\/usr\/bin\/python3.*3\.11\.9/);
+  assert.match(container.find("cxr-env").text(), /✗ 入っていません/);
+  assert.equal(container.find("cxr-run").disabled, false, "入れ直して押し直せる");
+  assert.notEqual(container.find("cxr-result").style.display, "flex", "結果は出ない");
+  await container.find("cxr-env-recheck").handlers.click();
+  assert.equal(container.find("cxr-env").style.display, "none");
+  assert.match(container.find("cxr-status").textContent, /環境は整いました/);
+  await container.find("cxr-run").handlers.click();
+  assert.equal(calls.filter((c) => c.inputs.length === 1).length, 1, "整ったので本処理が 1 回出る");
+  assert.equal(container.find("cxr-findings").value, "f");
+});
+
+test("画面: 一度通れば 2 回目の実行では事前チェックを省く（同意の窓を増やさない）", async () => {
+  const rep = { findings: "f", impression: "i", model: "m", revision: "84dfcba8aaaa", device: "cpu", seconds: 1, window: "minmax" };
+  const { host, calls, container } = fakeEnv(okOutcome(rep));
+  await activate(host);
+  await container.find("cxr-run").handlers.click();
+  await container.find("cxr-run").handlers.click();
+  assert.deepEqual(calls.map((c) => c.inputs.length), [0, 1, 1]);
+});
+
+test("画面: 事前チェックの後で環境が変わって本処理が落ちたら、次の実行で確かめ直す", async () => {
+  const lost = { ok: true, status: "error", errorName: "RuntimeError", errorValue: "missing-packages: この計算機に torch を入れてください", readFile: async () => null };
+  const { host, calls, container } = fakeEnv(lost);
+  await activate(host);
+  await container.find("cxr-run").handlers.click();
+  assert.match(container.find("cxr-status").textContent, /torch を入れてください.*環境を確認/);
+  await container.find("cxr-run").handlers.click();
+  assert.deepEqual(calls.map((c) => c.inputs.length), [0, 1, 0, 1], "2 回目は事前チェックからやり直す");
+});
+
+test("画面: 重みが未取得なら初回の取得を知らせる。事前チェックが断られたら理由を出し、本処理は出さない", async () => {
+  const rep = { findings: "f", impression: "i", model: "m", revision: "84dfcba8aaaa", device: "cpu", seconds: 1, window: "minmax" };
+  const e = fakeEnv(okOutcome(rep), undefined, [probeOutcome(envJson({}, { weightsCached: false }))]);
+  let seen = "";
+  const orig = e.host.compute.runJob;
+  e.host.compute.runJob = async (o, j) => { if (o.inputs.length) seen = e.container.find("cxr-status").textContent; return orig(o, j); };
+  await activate(e.host);
+  await e.container.find("cxr-run").handlers.click();
+  assert.match(seen, /430 MB/);
+  const d = fakeEnv(null, undefined, [{ ok: false, error: "local-unavailable" }]);
+  await activate(d.host);
+  await d.container.find("cxr-run").handlers.click();
+  assert.equal(d.calls.length, 1);
+  assert.match(d.container.find("cxr-status").textContent, /local-unavailable|この PC/);
 });
