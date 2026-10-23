@@ -46,6 +46,11 @@ def version_of(dist):
         return None
 
 
+def need_packages():
+    """必要なパッケージ（版は指定があるものだけ）。事前チェックと本処理で同じ表を使う"""
+    return {'torch': None, 'torchvision': None, 'transformers': GRAPHY['transformers'], 'pillow': None, 'numpy': None}
+
+
 def env_problem(installed, need):
     """入っていない・版が違うパッケージがあれば理由（先頭が missing-packages: / unsupported-version:）。無ければ None"""
     missing = [d for d in need if installed.get(d) is None]
@@ -118,7 +123,7 @@ def load_image(path):
 export const PY_MODEL = String.raw`
 
 stage('setup', 0.02)
-NEED = {'torch': None, 'torchvision': None, 'transformers': GRAPHY['transformers'], 'pillow': None, 'numpy': None}
+NEED = need_packages()
 problem = env_problem({d: version_of(d) for d in NEED}, NEED)
 if problem:
     raise RuntimeError(problem)
@@ -198,12 +203,58 @@ json.dump({
 stage('done', 1.0)
 `;
 
+/** 画像を送らない事前チェック。入っているパッケージと Python の場所を env.json に書くだけ（何も入れない・書き換えない） */
+export const PY_PROBE = String.raw`
+stage('probe', 0.3)
+need = need_packages()
+installed = {d: version_of(d) for d in need}
+torch_error = None
+cuda = None
+if installed['torch']:
+    try:
+        import torch
+        cuda = bool(torch.cuda.is_available())
+    except Exception as e:
+        torch_error = type(e).__name__ + ': ' + str(e)[:200]
+weights = None
+try:
+    from huggingface_hub import try_to_load_from_cache
+    weights = isinstance(try_to_load_from_cache(GRAPHY['model'], 'config.json', revision=GRAPHY['revision']), str)
+except Exception:
+    weights = None
+problem = env_problem(installed, need)
+if problem is None and torch_error:
+    problem = 'broken-package: torch を読み込めません（' + torch_error + '）。入れ直してください'
+os.makedirs('outputs', exist_ok=True)
+json.dump({'python': sys.executable, 'pyVersion': sys.version.split()[0], 'installed': installed, 'need': need,
+           'problem': problem, 'torchError': torch_error, 'cuda': cuda, 'weightsCached': weights},
+          open('outputs/env.json', 'w', encoding='utf-8'), ensure_ascii=False)
+stage('done', 1.0)
+`;
+
 export const PY = PY_PREP + PY_MODEL;
 
 /** 計算機に送るコード。差し込むのは固定の 3 値だけ。 */
 export function buildScript() {
   const cfg = { model: MODEL, revision: REVISION, transformers: TRANSFORMERS };
   return `GRAPHY = __import__('json').loads(${JSON.stringify(JSON.stringify(cfg))})\n` + PY;
+}
+
+/** 事前チェックのコード（画像は送らない）。差し込むのは buildScript と同じ固定の 3 値だけ。 */
+export function buildProbeScript() {
+  const cfg = { model: MODEL, revision: REVISION, transformers: TRANSFORMERS };
+  return `GRAPHY = __import__('json').loads(${JSON.stringify(JSON.stringify(cfg))})\n` + PY_PREP + PY_PROBE;
+}
+
+/**
+ * 不足・版違いを入れる pip のコマンド。計算機が実際に使う Python（sys.executable）を名指しする
+ * （Windows では python と py が別物のことがある）。空白などを含むパスは引用符で囲む。
+ */
+export function installCommand(/** @type {string} */ python, /** @type {Record<string, string | null>} */ installed, /** @type {Record<string, string | null>} */ need) {
+  const wanted = Object.keys(need).filter((d) => installed[d] == null || (need[d] && String(installed[d]).split("+")[0] !== need[d]));
+  if (!wanted.length) return null;
+  const exe = /^[\w./:\\-]+$/.test(python) ? python : `"${python}"`;
+  return `${exe} -m pip install ${wanted.map((d) => d + (need[d] ? "==" + need[d] : "")).join(" ")}`;
 }
 
 /** float32・C 順・little-endian の .npy を読む（cam.npy 用）。 */
@@ -322,7 +373,8 @@ export async function activate(host) {
   const runBtn = el("button", { textContent: "実行", testid: "cxr-run", style: "align-self: flex-start; padding: 4px 18px" });
   const status = el("div", { testid: "cxr-status", style: "min-height: 1.4em; opacity: 0.9" });
   const result = el("div", { testid: "cxr-result", style: "display: none; flex-direction: column; gap: 8px" });
-  root.append(banner, about, el("div", { style: "opacity: 0.8" }, `対象: ${target.seriesLabel ?? ""}`), runBtn, status, result);
+  const envBox = el("div", { testid: "cxr-env", style: `display: none; flex-direction: column; gap: 6px; ${BANNER_STYLE}` });
+  root.append(banner, about, el("div", { style: "opacity: 0.8" }, `対象: ${target.seriesLabel ?? ""}`), runBtn, status, envBox, result);
 
   const setStatus = (/** @type {string} */ t) => { status.textContent = t; state.status = t; };
   const onProgress = (/** @type {number} */ p, /** @type {string | undefined} */ m) => setStatus(`${Math.round(p * 100)}% ${m ?? ""}`);
@@ -386,13 +438,95 @@ export async function activate(host) {
     return box;
   }
 
+  /** 事前チェックを通ったか（この窓のあいだだけ覚える。通ったあとは同意の窓を増やさない） */
+  let envOk = false;
+
+  /** 不足・版違いの案内。入れるのは利用者（環境は書き換えない）。 */
+  const showEnv = (/** @type {any} */ env) => {
+    const rows = Object.keys(env.need).map((d) => {
+      const v = env.installed[d];
+      const want = env.need[d];
+      const ok = v != null && (!want || String(v).split("+")[0] === want);
+      return el("div", { style: "display: flex; gap: 12px; font-size: 12px" },
+        el("span", { style: "width: 110px; font-weight: 600" }, d),
+        el("span", { style: "width: 110px" }, want ? "== " + want : "（版は問わない）"),
+        el("span", {}, v == null ? "✗ 入っていません" : ok ? "✓ " + v : "✗ " + v + "（版が違います）"));
+    });
+    const cmd = installCommand(env.python, env.installed, env.need);
+    const kids = [
+      el("div", { style: "font-weight: 600" }, "実行の前に、この PC の計算機の Python に足りないものがあります"),
+      el("div", { testid: "cxr-env-python", style: "font-size: 12px; word-break: break-all" }, `使われる Python: ${env.python}（${env.pyVersion}）`),
+      ...rows,
+    ];
+    if (env.problem && /^broken-package/.test(env.problem)) kids.push(el("div", { style: "font-size: 12px" }, failureText(env.problem)));
+    if (cmd) {
+      const area = el("textarea", { value: cmd, readOnly: true, rows: 4, testid: "cxr-env-command", style: "width: 100%; box-sizing: border-box; font: 12px ui-monospace, monospace" });
+      const copy = el("button", { textContent: "コマンドをコピー", testid: "cxr-env-copy", style: "font-size: 11px" });
+      copy.addEventListener("click", () => { void navigator.clipboard?.writeText(cmd); });
+      kids.push(
+        el("div", { style: "font-size: 12px" }, "ターミナル（Windows は PowerShell かコマンドプロンプト）で、次を実行してください。" +
+          "このプラグインは環境を書き換えません。"),
+        area, copy,
+        el("div", { style: "font-size: 11px; opacity: 0.85; line-height: 1.5" },
+          "GPU（CUDA）で動かしたいときは、torch だけ pytorch.org の案内の版を入れてください。" +
+          "パスを引用符で囲んだ場合、PowerShell では先頭に & を付けてください。"));
+    }
+    const again = el("button", { textContent: "再確認", testid: "cxr-env-recheck", style: "align-self: flex-start; padding: 2px 14px" });
+    again.addEventListener("click", async () => {
+      again.disabled = true;
+      if (await checkEnv()) setStatus("環境は整いました。「実行」を押してください");
+      again.disabled = false;
+    });
+    kids.push(again, el("div", { style: "font-size: 11px; opacity: 0.85" }, "入れたら［再確認］を押してください（本体の再起動は要りません）。"));
+    envBox.replaceChildren(...kids);
+    envBox.style.display = "flex";
+  };
+
+  /** 画像を送らない小さなジョブで、計算機の Python を確かめる。整っていれば true */
+  const checkEnv = async () => {
+    setStatus("環境を確認しています…");
+    const r = await host.compute.runJob({ endpointId: "local", inputs: [], script: buildProbeScript(), timeoutSec: 300 }, { onProgress });
+    if (!r.ok) {
+      state.error = r.error;
+      setStatus(r.cancelled ? "取り消しました" : explain(r.error));
+      return false;
+    }
+    if (r.status !== "ok") {
+      state.error = `${r.errorName}: ${r.errorValue}`;
+      setStatus(failureText(r.errorValue));
+      return false;
+    }
+    const raw = await r.readFile("env.json");
+    if (!raw) {
+      state.error = "no-env";
+      setStatus("失敗: 環境の確認結果が返りませんでした");
+      return false;
+    }
+    const env = JSON.parse(new TextDecoder().decode(raw));
+    state.env = env;
+    if (env.problem) {
+      envOk = false;
+      showEnv(env);
+      setStatus("足りないものがあります。下の手順で入れて、［再確認］を押してください");
+      return false;
+    }
+    envOk = true;
+    envBox.style.display = "none";
+    envBox.replaceChildren();
+    return true;
+  };
+
   runBtn.addEventListener("click", async () => {
     runBtn.disabled = true;
+    if (!envOk && !(await checkEnv())) {
+      runBtn.disabled = false;
+      return;
+    }
     result.style.display = "none";
     result.replaceChildren();
     host.clearOverlay?.(target.tileId);
     state.phase = "running"; state.error = undefined; state.report = undefined; state.cam = undefined;
-    setStatus("送っています…");
+    setStatus(state.env?.weightsCached === false ? "送っています…（初回は重み約 430 MB を取得します）" : "送っています…");
     const r = await host.compute.runJob({
       endpointId: "local",
       inputs: [{ studyUid: target.studyUid, seriesUid: target.seriesUid, format: "npz" }],
@@ -407,7 +541,9 @@ export async function activate(host) {
     }
     if (r.status !== "ok") {
       state.phase = "failed"; state.error = `${r.errorName}: ${r.errorValue}`; state.stderr = r.stderr;
-      setStatus(failureText(r.errorValue));
+      const envLost = /^(missing-packages|unsupported-version): /.test(String(r.errorValue));
+      if (envLost) envOk = false; // 確認のあとで環境が変わった。次の「実行」でもう一度確かめて手順を出す
+      setStatus(failureText(r.errorValue) + (envLost ? "（「実行」を押すと環境を確認して、導入の手順を示します）" : ""));
       runBtn.disabled = false;
       return;
     }
